@@ -103,6 +103,7 @@ import {
 } from "@excalidraw/common";
 
 import {
+  getObservedAppState,
   getCommonBounds,
   getElementAbsoluteCoords,
   bindOrUnbindLinearElements,
@@ -160,7 +161,6 @@ import {
   maybeParseEmbedSrc,
   getEmbedLink,
   getInitializedImageElements,
-  loadHTMLImageElement,
   normalizeSVG,
   updateImageCache as _updateImageCache,
   getBoundTextElement,
@@ -230,6 +230,8 @@ import {
   CaptureUpdateAction,
   type ElementUpdate,
   hitElementBoundingBox,
+  isLineElement,
+  isSimpleArrow,
 } from "@excalidraw/element";
 
 import type { LocalPoint, Radians } from "@excalidraw/math";
@@ -255,10 +257,8 @@ import type {
   ExcalidrawEmbeddableElement,
   Ordered,
   MagicGenerationData,
-  ExcalidrawNonSelectionElement,
   ExcalidrawArrowElement,
   ExcalidrawElbowArrowElement,
-  SceneElementsMap,
 } from "@excalidraw/element/types";
 
 import type { Mutable, ValueOf } from "@excalidraw/common/utility-types";
@@ -336,7 +336,6 @@ import {
 } from "../scene";
 import { getStateForZoom } from "../scene/zoom";
 import {
-  dataURLToFile,
   dataURLToString,
   generateIdFromFile,
   getDataURL,
@@ -438,7 +437,6 @@ import type {
   AppProps,
   AppState,
   BinaryFileData,
-  DataURL,
   ExcalidrawImperativeAPI,
   BinaryFiles,
   Gesture,
@@ -700,6 +698,8 @@ class App extends React.Component<AppProps, AppState> {
         addFiles: this.addFiles,
         resetScene: this.resetScene,
         getSceneElementsIncludingDeleted: this.getSceneElementsIncludingDeleted,
+        getSceneElementsMapIncludingDeleted:
+          this.getSceneElementsMapIncludingDeleted,
         history: {
           clear: this.resetHistory,
         },
@@ -1516,7 +1516,6 @@ class App extends React.Component<AppProps, AppState> {
         width: this.state.width,
         editingTextElement: this.state.editingTextElement,
         newElementId: this.state.newElement?.id,
-        pendingImageElementId: this.state.pendingImageElementId,
       });
     this.visibleElements = visibleElements;
 
@@ -3002,6 +3001,7 @@ class App extends React.Component<AppProps, AppState> {
     }
   };
 
+  // TODO: this is so spaghetti, we should refactor it and cover it with tests
   public pasteFromClipboard = withBatchedUpdates(
     async (event: ClipboardEvent) => {
       const isPlainPaste = !!IS_PLAIN_PASTE;
@@ -3066,6 +3066,7 @@ class App extends React.Component<AppProps, AppState> {
         const imageElement = this.createImageElement({ sceneX, sceneY });
         this.insertImageElement(imageElement, file);
         this.initializeImageDimensions(imageElement);
+        this.store.scheduleCapture();
         this.setState({
           selectedElementIds: makeNextSelectedElementIds(
             {
@@ -3176,6 +3177,7 @@ class App extends React.Component<AppProps, AppState> {
             }
           }
           if (embeddables.length) {
+            this.store.scheduleCapture();
             this.setState({
               selectedElementIds: Object.fromEntries(
                 embeddables.map((embeddable) => [embeddable.id, true]),
@@ -3288,11 +3290,10 @@ class App extends React.Component<AppProps, AppState> {
       this.addMissingFiles(opts.files);
     }
 
-    this.store.scheduleCapture();
-
     const nextElementsToSelect =
       excludeElementsInFramesFromSelection(duplicatedElements);
 
+    this.store.scheduleCapture();
     this.setState(
       {
         ...this.state,
@@ -3526,7 +3527,7 @@ class App extends React.Component<AppProps, AppState> {
     }
 
     this.scene.insertElements(textElements);
-
+    this.store.scheduleCapture();
     this.setState({
       selectedElementIds: makeNextSelectedElementIds(
         Object.fromEntries(textElements.map((el) => [el.id, true])),
@@ -3548,8 +3549,6 @@ class App extends React.Component<AppProps, AppState> {
       });
       PLAIN_PASTE_TOAST_SHOWN = true;
     }
-
-    this.store.scheduleCapture();
   }
 
   setAppState: React.Component<any, AppState>["setState"] = (
@@ -3907,22 +3906,19 @@ class App extends React.Component<AppProps, AppState> {
     }) => {
       const { elements, appState, collaborators, captureUpdate } = sceneData;
 
-      const nextElements = elements ? syncInvalidIndices(elements) : undefined;
-
       if (captureUpdate) {
-        const nextElementsMap = elements
-          ? (arrayToMap(nextElements ?? []) as SceneElementsMap)
-          : undefined;
-
-        const nextAppState = appState
-          ? // new instance, with partial appstate applied to previously captured one, including hidden prop inside `prevCommittedAppState`
-            Object.assign({}, this.store.snapshot.appState, appState)
+        const nextElements = elements ? elements : undefined;
+        const observedAppState = appState
+          ? getObservedAppState({
+              ...this.store.snapshot.appState,
+              ...appState,
+            })
           : undefined;
 
         this.store.scheduleMicroAction({
           action: captureUpdate,
-          elements: nextElementsMap,
-          appState: nextAppState,
+          elements: nextElements,
+          appState: observedAppState,
         });
       }
 
@@ -3930,8 +3926,8 @@ class App extends React.Component<AppProps, AppState> {
         this.setState(appState);
       }
 
-      if (nextElements) {
-        this.scene.replaceAllElements(nextElements);
+      if (elements) {
+        this.scene.replaceAllElements(elements);
       }
 
       if (collaborators) {
@@ -4428,12 +4424,11 @@ class App extends React.Component<AppProps, AppState> {
         const selectedElements = this.scene.getSelectedElements(this.state);
         if (selectedElements.length === 1) {
           const selectedElement = selectedElements[0];
-          if (event[KEYS.CTRL_OR_CMD]) {
+          if (event[KEYS.CTRL_OR_CMD] || isLineElement(selectedElement)) {
             if (isLinearElement(selectedElement)) {
               if (
                 !this.state.editingLinearElement ||
-                this.state.editingLinearElement.elementId !==
-                  selectedElements[0].id
+                this.state.editingLinearElement.elementId !== selectedElement.id
               ) {
                 this.store.scheduleCapture();
                 if (!isElbowArrow(selectedElement)) {
@@ -4712,16 +4707,10 @@ class App extends React.Component<AppProps, AppState> {
   };
 
   setActiveTool = (
-    tool: (
-      | (
-          | { type: Exclude<ToolType, "image"> }
-          | {
-              type: Extract<ToolType, "image">;
-              insertOnCanvasDirectly?: boolean;
-            }
-        )
-      | { type: "custom"; customType: string }
-    ) & { locked?: boolean; fromSelection?: boolean },
+    tool: ({ type: ToolType } | { type: "custom"; customType: string }) & {
+      locked?: boolean;
+      fromSelection?: boolean;
+    },
     keepSelection = false,
   ) => {
     if (!this.isToolSupported(tool.type)) {
@@ -4747,10 +4736,7 @@ class App extends React.Component<AppProps, AppState> {
       this.setState({ suggestedBindings: [] });
     }
     if (nextActiveTool.type === "image") {
-      this.onImageAction({
-        insertOnCanvasDirectly:
-          (tool.type === "image" && tool.insertOnCanvasDirectly) ?? false,
-      });
+      this.onImageAction();
     }
 
     this.setState((prevState) => {
@@ -5438,17 +5424,17 @@ class App extends React.Component<AppProps, AppState> {
     );
 
     if (selectedElements.length === 1 && isLinearElement(selectedElements[0])) {
+      const selectedLinearElement: ExcalidrawLinearElement =
+        selectedElements[0];
       if (
-        event[KEYS.CTRL_OR_CMD] &&
-        (!this.state.editingLinearElement ||
-          this.state.editingLinearElement.elementId !==
-            selectedElements[0].id) &&
-        !isElbowArrow(selectedElements[0])
+        ((event[KEYS.CTRL_OR_CMD] && isSimpleArrow(selectedLinearElement)) ||
+          isLineElement(selectedLinearElement)) &&
+        this.state.editingLinearElement?.elementId !== selectedLinearElement.id
       ) {
         this.store.scheduleCapture();
         this.setState({
           editingLinearElement: new LinearElementEditor(
-            selectedElements[0],
+            selectedLinearElement,
             this.scene.getNonDeletedElementsMap(),
           ),
         });
@@ -5515,6 +5501,13 @@ class App extends React.Component<AppProps, AppState> {
 
           return;
         }
+      } else if (
+        this.state.editingLinearElement &&
+        this.state.editingLinearElement.elementId ===
+          selectedLinearElement.id &&
+        isLineElement(selectedLinearElement)
+      ) {
+        return;
       }
     }
 
@@ -5563,36 +5556,43 @@ class App extends React.Component<AppProps, AppState> {
         return;
       }
 
-      const container = this.getTextBindableContainerAtPosition(sceneX, sceneY);
+      // shouldn't edit/create text when inside line editor (often false positive)
 
-      if (container) {
-        if (
-          hasBoundTextElement(container) ||
-          !isTransparent(container.backgroundColor) ||
-          hitElementItself({
-            point: pointFrom(sceneX, sceneY),
-            element: container,
-            elementsMap: this.scene.getNonDeletedElementsMap(),
-            threshold: this.getElementHitThreshold(container),
-          })
-        ) {
-          const midPoint = getContainerCenter(
-            container,
-            this.state,
-            this.scene.getNonDeletedElementsMap(),
-          );
+      if (!this.state.editingLinearElement) {
+        const container = this.getTextBindableContainerAtPosition(
+          sceneX,
+          sceneY,
+        );
 
-          sceneX = midPoint.x;
-          sceneY = midPoint.y;
+        if (container) {
+          if (
+            hasBoundTextElement(container) ||
+            !isTransparent(container.backgroundColor) ||
+            hitElementItself({
+              point: pointFrom(sceneX, sceneY),
+              element: container,
+              elementsMap: this.scene.getNonDeletedElementsMap(),
+              threshold: this.getElementHitThreshold(container),
+            })
+          ) {
+            const midPoint = getContainerCenter(
+              container,
+              this.state,
+              this.scene.getNonDeletedElementsMap(),
+            );
+
+            sceneX = midPoint.x;
+            sceneY = midPoint.y;
+          }
         }
-      }
 
-      this.startTextEditing({
-        sceneX,
-        sceneY,
-        insertAtParentCenter: !event.altKey,
-        container,
-      });
+        this.startTextEditing({
+          sceneX,
+          sceneY,
+          insertAtParentCenter: !event.altKey,
+          container,
+        });
+      }
     }
   };
 
@@ -6148,7 +6148,10 @@ class App extends React.Component<AppProps, AppState> {
         setCursor(this.interactiveCanvas, CURSOR_TYPE.AUTO);
       } else if (isOverScrollBar) {
         setCursor(this.interactiveCanvas, CURSOR_TYPE.AUTO);
-      } else if (this.state.selectedLinearElement) {
+      } else if (
+        this.state.selectedLinearElement &&
+        hitElement?.id === this.state.selectedLinearElement.elementId
+      ) {
         this.handleHoverSelectedLinearElement(
           this.state.selectedLinearElement,
           scenePointerX,
@@ -6582,34 +6585,6 @@ class App extends React.Component<AppProps, AppState> {
         this.state.activeTool.type,
         pointerDownState,
       );
-    } else if (this.state.activeTool.type === "image") {
-      // reset image preview on pointerdown
-      setCursor(this.interactiveCanvas, CURSOR_TYPE.CROSSHAIR);
-
-      // retrieve the latest element as the state may be stale
-      const pendingImageElement =
-        this.state.pendingImageElementId &&
-        this.scene.getElement(this.state.pendingImageElementId);
-
-      if (!pendingImageElement) {
-        return;
-      }
-
-      this.setState({
-        newElement: pendingImageElement as ExcalidrawNonSelectionElement,
-        pendingImageElementId: null,
-        multiElement: null,
-      });
-
-      const { x, y } = viewportCoordsToSceneCoords(event, this.state);
-
-      const frame = this.getTopLayerFrameAtSceneCoords({ x, y });
-
-      this.scene.mutateElement(pendingImageElement, {
-        x,
-        y,
-        frameId: frame ? frame.id : null,
-      });
     } else if (this.state.activeTool.type === "freedraw") {
       this.handleFreeDrawElementOnPointerDown(
         event,
@@ -6633,7 +6608,8 @@ class App extends React.Component<AppProps, AppState> {
       );
     } else if (
       this.state.activeTool.type !== "eraser" &&
-      this.state.activeTool.type !== "hand"
+      this.state.activeTool.type !== "hand" &&
+      this.state.activeTool.type !== "image"
     ) {
       this.createGenericElementOnPointerDown(
         this.state.activeTool.type,
@@ -8965,6 +8941,7 @@ class App extends React.Component<AppProps, AppState> {
         );
 
         this.store.scheduleCapture();
+
         if (hitLockedElement?.locked) {
           this.setState({
             activeLockedId:
@@ -9077,10 +9054,6 @@ class App extends React.Component<AppProps, AppState> {
         EVENT.KEYUP,
         pointerDownState.eventListeners.onKeyUp!,
       );
-
-      if (this.state.pendingImageElementId) {
-        this.setState({ pendingImageElementId: null });
-      }
 
       this.props?.onPointerUp?.(activeTool, pointerDownState);
       this.onPointerUpEmitter.trigger(
@@ -9859,11 +9832,9 @@ class App extends React.Component<AppProps, AppState> {
   private initializeImage = async ({
     imageFile,
     imageElement: _imageElement,
-    showCursorImagePreview = false,
   }: {
     imageFile: File;
     imageElement: ExcalidrawImageElement;
-    showCursorImagePreview?: boolean;
   }) => {
     // at this point this should be guaranteed image file, but we do this check
     // to satisfy TS down the line
@@ -9921,26 +9892,12 @@ class App extends React.Component<AppProps, AppState> {
       }
     }
 
-    if (showCursorImagePreview) {
-      const dataURL = this.files[fileId]?.dataURL;
-      // optimization so that we don't unnecessarily resize the original
-      // full-size file for cursor preview
-      // (it's much faster to convert the resized dataURL to File)
-      const resizedFile = dataURL && dataURLToFile(dataURL);
-
-      this.setImagePreviewCursor(resizedFile || imageFile);
-    }
-
     const dataURL =
       this.files[fileId]?.dataURL || (await getDataURL(imageFile));
 
-    const imageElement = this.scene.mutateElement(
-      _imageElement,
-      {
-        fileId,
-      },
-      { informMutation: false, isDragging: false },
-    ) as NonDeleted<InitializedExcalidrawImageElement>;
+    let imageElement = newElementWith(_imageElement, {
+      fileId,
+    }) as NonDeleted<InitializedExcalidrawImageElement>;
 
     return new Promise<NonDeleted<InitializedExcalidrawImageElement>>(
       async (resolve, reject) => {
@@ -9954,28 +9911,38 @@ class App extends React.Component<AppProps, AppState> {
               lastRetrieved: Date.now(),
             },
           ]);
-          const cachedImageData = this.imageCache.get(fileId);
+
+          let cachedImageData = this.imageCache.get(fileId);
+
           if (!cachedImageData) {
             this.addNewImagesToImageCache();
-            await this.updateImageCache([imageElement]);
+
+            const { updatedFiles } = await this.updateImageCache([
+              imageElement,
+            ]);
+
+            if (updatedFiles.size) {
+              ShapeCache.delete(_imageElement);
+            }
+
+            cachedImageData = this.imageCache.get(fileId);
           }
-          if (cachedImageData?.image instanceof Promise) {
-            await cachedImageData.image;
+
+          const imageHTML = await cachedImageData?.image;
+
+          if (imageHTML && this.state.newElement?.id !== imageElement.id) {
+            const naturalDimensions = this.getImageNaturalDimensions(
+              imageElement,
+              imageHTML,
+            );
+
+            imageElement = newElementWith(imageElement, naturalDimensions);
           }
-          if (
-            this.state.pendingImageElementId !== imageElement.id &&
-            this.state.newElement?.id !== imageElement.id
-          ) {
-            this.initializeImageDimensions(imageElement, true);
-          }
+
           resolve(imageElement);
         } catch (error: any) {
           console.error(error);
           reject(new Error(t("errors.imageInsertError")));
-        } finally {
-          if (!showCursorImagePreview) {
-            resetCursor(this.interactiveCanvas);
-          }
         }
       },
     );
@@ -9987,7 +9954,6 @@ class App extends React.Component<AppProps, AppState> {
   insertImageElement = async (
     imageElement: ExcalidrawImageElement,
     imageFile: File,
-    showCursorImagePreview?: boolean,
   ) => {
     // we should be handling all cases upstream, but in case we forget to handle
     // a future case, let's throw here
@@ -9999,11 +9965,29 @@ class App extends React.Component<AppProps, AppState> {
     this.scene.insertElement(imageElement);
 
     try {
-      return await this.initializeImage({
+      const image = await this.initializeImage({
         imageFile,
         imageElement,
-        showCursorImagePreview,
       });
+
+      const nextElements = this.scene
+        .getElementsIncludingDeleted()
+        .map((element) => {
+          if (element.id === image.id) {
+            return image;
+          }
+
+          return element;
+        });
+
+      // schedules an immediate micro action, which will update snapshot,
+      // but won't be undoable, which is what we want!
+      this.updateScene({
+        captureUpdate: CaptureUpdateAction.NEVER,
+        elements: nextElements,
+      });
+
+      return image;
     } catch (error: any) {
       this.scene.mutateElement(imageElement, {
         isDeleted: true,
@@ -10016,58 +10000,7 @@ class App extends React.Component<AppProps, AppState> {
     }
   };
 
-  private setImagePreviewCursor = async (imageFile: File) => {
-    // mustn't be larger than 128 px
-    // https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_Basic_User_Interface/Using_URL_values_for_the_cursor_property
-    const cursorImageSizePx = 96;
-    let imagePreview;
-
-    try {
-      imagePreview = await resizeImageFile(imageFile, {
-        maxWidthOrHeight: cursorImageSizePx,
-      });
-    } catch (e: any) {
-      if (e.cause === "UNSUPPORTED") {
-        throw new Error(t("errors.unsupportedFileType"));
-      }
-      throw e;
-    }
-
-    let previewDataURL = await getDataURL(imagePreview);
-
-    // SVG cannot be resized via `resizeImageFile` so we resize by rendering to
-    // a small canvas
-    if (imageFile.type === MIME_TYPES.svg) {
-      const img = await loadHTMLImageElement(previewDataURL);
-
-      let height = Math.min(img.height, cursorImageSizePx);
-      let width = height * (img.width / img.height);
-
-      if (width > cursorImageSizePx) {
-        width = cursorImageSizePx;
-        height = width * (img.height / img.width);
-      }
-
-      const canvas = document.createElement("canvas");
-      canvas.height = height;
-      canvas.width = width;
-      const context = canvas.getContext("2d")!;
-
-      context.drawImage(img, 0, 0, width, height);
-
-      previewDataURL = canvas.toDataURL(MIME_TYPES.svg) as DataURL;
-    }
-
-    if (this.state.pendingImageElementId) {
-      setCursor(this.interactiveCanvas, `url(${previewDataURL}) 4 4, auto`);
-    }
-  };
-
-  private onImageAction = async ({
-    insertOnCanvasDirectly,
-  }: {
-    insertOnCanvasDirectly: boolean;
-  }) => {
+  private onImageAction = async () => {
     try {
       const clientX = this.state.width / 2 + this.state.offsetLeft;
       const clientY = this.state.height / 2 + this.state.offsetTop;
@@ -10090,34 +10023,20 @@ class App extends React.Component<AppProps, AppState> {
         addToFrameUnderCursor: false,
       });
 
-      if (insertOnCanvasDirectly) {
-        this.insertImageElement(imageElement, imageFile);
-        this.initializeImageDimensions(imageElement);
-        this.setState(
-          {
-            selectedElementIds: makeNextSelectedElementIds(
-              { [imageElement.id]: true },
-              this.state,
-            ),
-          },
-          () => {
-            this.actionManager.executeAction(actionFinalize);
-          },
-        );
-      } else {
-        this.setState(
-          {
-            pendingImageElementId: imageElement.id,
-          },
-          () => {
-            this.insertImageElement(
-              imageElement,
-              imageFile,
-              /* showCursorImagePreview */ true,
-            );
-          },
-        );
-      }
+      this.insertImageElement(imageElement, imageFile);
+      this.initializeImageDimensions(imageElement);
+      this.store.scheduleCapture();
+      this.setState(
+        {
+          selectedElementIds: makeNextSelectedElementIds(
+            { [imageElement.id]: true },
+            this.state,
+          ),
+        },
+        () => {
+          this.actionManager.executeAction(actionFinalize);
+        },
+      );
     } catch (error: any) {
       if (error.name !== "AbortError") {
         console.error(error);
@@ -10126,7 +10045,6 @@ class App extends React.Component<AppProps, AppState> {
       }
       this.setState(
         {
-          pendingImageElementId: null,
           newElement: null,
           activeTool: updateActiveTool(this.state, { type: "selection" }),
         },
@@ -10137,20 +10055,18 @@ class App extends React.Component<AppProps, AppState> {
     }
   };
 
-  initializeImageDimensions = (
-    imageElement: ExcalidrawImageElement,
-    forceNaturalSize = false,
-  ) => {
-    const image =
+  initializeImageDimensions = (imageElement: ExcalidrawImageElement) => {
+    const imageHTML =
       isInitializedImageElement(imageElement) &&
       this.imageCache.get(imageElement.fileId)?.image;
 
-    if (!image || image instanceof Promise) {
+    if (!imageHTML || imageHTML instanceof Promise) {
       if (
         imageElement.width < DRAGGING_THRESHOLD / this.state.zoom.value &&
         imageElement.height < DRAGGING_THRESHOLD / this.state.zoom.value
       ) {
         const placeholderSize = 100 / this.state.zoom.value;
+
         this.scene.mutateElement(imageElement, {
           x: imageElement.x - placeholderSize / 2,
           y: imageElement.y - placeholderSize / 2,
@@ -10162,37 +10078,48 @@ class App extends React.Component<AppProps, AppState> {
       return;
     }
 
+    // if user-created bounding box is below threshold, assume the
+    // intention was to click instead of drag, and use the image's
+    // intrinsic size
     if (
-      forceNaturalSize ||
-      // if user-created bounding box is below threshold, assume the
-      // intention was to click instead of drag, and use the image's
-      // intrinsic size
-      (imageElement.width < DRAGGING_THRESHOLD / this.state.zoom.value &&
-        imageElement.height < DRAGGING_THRESHOLD / this.state.zoom.value)
+      imageElement.width < DRAGGING_THRESHOLD / this.state.zoom.value &&
+      imageElement.height < DRAGGING_THRESHOLD / this.state.zoom.value
     ) {
-      const minHeight = Math.max(this.state.height - 120, 160);
-      // max 65% of canvas height, clamped to <300px, vh - 120px>
-      const maxHeight = Math.min(
-        minHeight,
-        Math.floor(this.state.height * 0.5) / this.state.zoom.value,
+      const naturalDimensions = this.getImageNaturalDimensions(
+        imageElement,
+        imageHTML,
       );
 
-      const height = Math.min(image.naturalHeight, maxHeight);
-      const width = height * (image.naturalWidth / image.naturalHeight);
-
-      // add current imageElement width/height to account for previous centering
-      // of the placeholder image
-      const x = imageElement.x + imageElement.width / 2 - width / 2;
-      const y = imageElement.y + imageElement.height / 2 - height / 2;
-
-      this.scene.mutateElement(imageElement, {
-        x,
-        y,
-        width,
-        height,
-        crop: null,
-      });
+      this.scene.mutateElement(imageElement, naturalDimensions);
     }
+  };
+
+  private getImageNaturalDimensions = (
+    imageElement: ExcalidrawImageElement,
+    imageHTML: HTMLImageElement,
+  ) => {
+    const minHeight = Math.max(this.state.height - 120, 160);
+    // max 65% of canvas height, clamped to <300px, vh - 120px>
+    const maxHeight = Math.min(
+      minHeight,
+      Math.floor(this.state.height * 0.5) / this.state.zoom.value,
+    );
+
+    const height = Math.min(imageHTML.naturalHeight, maxHeight);
+    const width = height * (imageHTML.naturalWidth / imageHTML.naturalHeight);
+
+    // add current imageElement width/height to account for previous centering
+    // of the placeholder image
+    const x = imageElement.x + imageElement.width / 2 - width / 2;
+    const y = imageElement.y + imageElement.height / 2 - height / 2;
+
+    return {
+      x,
+      y,
+      width,
+      height,
+      crop: null,
+    };
   };
 
   /** updates image cache, refreshing updated elements and/or setting status
@@ -10206,13 +10133,7 @@ class App extends React.Component<AppProps, AppState> {
       fileIds: elements.map((element) => element.fileId),
       files,
     });
-    if (updatedFiles.size || erroredFiles.size) {
-      for (const element of elements) {
-        if (updatedFiles.has(element.fileId)) {
-          ShapeCache.delete(element);
-        }
-      }
-    }
+
     if (erroredFiles.size) {
       this.scene.replaceAllElements(
         this.scene.getElementsIncludingDeleted().map((element) => {
@@ -10248,6 +10169,15 @@ class App extends React.Component<AppProps, AppState> {
         uncachedImageElements,
         files,
       );
+
+      if (updatedFiles.size) {
+        for (const element of uncachedImageElements) {
+          if (updatedFiles.has(element.fileId)) {
+            ShapeCache.delete(element);
+          }
+        }
+      }
+
       if (updatedFiles.size) {
         this.scene.triggerUpdate();
       }
@@ -10431,6 +10361,7 @@ class App extends React.Component<AppProps, AppState> {
         const imageElement = this.createImageElement({ sceneX, sceneY });
         this.insertImageElement(imageElement, file);
         this.initializeImageDimensions(imageElement);
+        this.store.scheduleCapture();
         this.setState({
           selectedElementIds: makeNextSelectedElementIds(
             { [imageElement.id]: true },
@@ -10481,6 +10412,7 @@ class App extends React.Component<AppProps, AppState> {
           link: normalizeLink(text),
         });
         if (embeddable) {
+          this.store.scheduleCapture();
           this.setState({ selectedElementIds: { [embeddable.id]: true } });
         }
       }
@@ -10535,7 +10467,7 @@ class App extends React.Component<AppProps, AppState> {
         // otherwise we would end up with duplicated fractional indices on undo
         this.store.scheduleMicroAction({
           action: CaptureUpdateAction.NEVER,
-          elements: arrayToMap(elements) as SceneElementsMap,
+          elements,
           appState: undefined,
         });
 

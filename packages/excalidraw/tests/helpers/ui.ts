@@ -1,6 +1,10 @@
 import { pointFrom, pointRotateRads } from "@excalidraw/math";
 
-import { getCommonBounds, getElementPointsCoords } from "@excalidraw/element";
+import {
+  elementCenterPoint,
+  getCommonBounds,
+  getElementPointsCoords,
+} from "@excalidraw/element";
 import { cropElement } from "@excalidraw/element";
 import {
   getTransformHandles,
@@ -16,7 +20,7 @@ import {
   isTextElement,
   isFrameLikeElement,
 } from "@excalidraw/element";
-import { KEYS, arrayToMap, elementCenterPoint } from "@excalidraw/common";
+import { KEYS, arrayToMap } from "@excalidraw/common";
 
 import type { GlobalPoint, LocalPoint, Radians } from "@excalidraw/math";
 
@@ -36,7 +40,7 @@ import type {
 } from "@excalidraw/element/types";
 
 import { createTestHook } from "../../components/App";
-import { getTextEditor } from "../queries/dom";
+import { getTextEditor, TEXT_EDITOR_SELECTOR } from "../queries/dom";
 import { act, fireEvent, GlobalTestState, screen } from "../test-utils";
 
 import { API } from "./api";
@@ -549,16 +553,15 @@ export class UI {
   static async editText<
     T extends ExcalidrawTextElement | ExcalidrawTextContainer,
   >(element: T, text: string) {
-    const textEditorSelector = ".excalidraw-textEditorContainer > textarea";
     const openedEditor =
-      document.querySelector<HTMLTextAreaElement>(textEditorSelector);
+      document.querySelector<HTMLTextAreaElement>(TEXT_EDITOR_SELECTOR);
 
     if (!openedEditor) {
       mouse.select(element);
       Keyboard.keyPress(KEYS.ENTER);
     }
 
-    const editor = await getTextEditor(textEditorSelector);
+    const editor = await getTextEditor();
     if (!editor) {
       throw new Error("Can't find wysiwyg text editor in the dom");
     }
